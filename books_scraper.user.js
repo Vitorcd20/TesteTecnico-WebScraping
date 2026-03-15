@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Books to Scrape - CSV Exporter
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Exporta categorias e livros do books.toscrape.com para CSV
 // @author       You
 // @match        https://books.toscrape.com/*
-// @grant        none
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
 
 (function () {
@@ -17,10 +17,10 @@
         return (text || '').replace(/\s+/g, ' ').trim();
     }
 
-    function toAbsoluteUrl(href) {
+    function toAbsoluteUrl(href, base) {
         if (!href) return '';
         try {
-            return new URL(href, 'https://books.toscrape.com/').href;
+            return new URL(href, base || 'https://books.toscrape.com/').href;
         } catch {
             return href;
         }
@@ -81,7 +81,7 @@
 
         links.forEach(link => {
             const name = cleanText(link.textContent);
-            if (IGNORE.includes(name.toLowerCase())) return; // ignora falsos positivos
+            if (IGNORE.includes(name.toLowerCase())) return;
             const url = toAbsoluteUrl(link.getAttribute('href'));
             const isCurrent = currentUrl.startsWith(url) && url !== 'https://books.toscrape.com/'
                 ? 'true'
@@ -92,45 +92,22 @@
         return rows;
     }
 
-    // ── Extração de livros ────────────────────────────────────────────────────
+    // ── Extração de livros de um documento HTML ───────────────────────────────
 
-    function scrapeBooks() {
-        // Nome da categoria atual
-        const categoryEl = document.querySelector('.side_categories ul li ul li a')
-            && [...document.querySelectorAll('.side_categories ul li ul li a')]
-                .find(a => {
-                    const url = toAbsoluteUrl(a.getAttribute('href'));
-                    return window.location.href.includes(
-                        url.replace('https://books.toscrape.com/', '')
-                              .replace('/index.html', '')
-                    );
-                });
-
-        // Fallback: pega o <h1> da página ou "All"
-        const categoryName = cleanText(
-            document.querySelector('.page-header.action h1')?.textContent ||
-            (categoryEl ? categoryEl.textContent : 'All')
-        );
-
-        const articles = document.querySelectorAll('article.product_pod');
-        const rows = [rowToCSV([
-            'category_name', 'book_title', 'price', 'currency',
-            'availability', 'rating', 'book_url', 'image_url'
-        ])];
+    function extractBooksFromDoc(doc, categoryName, baseUrl) {
+        const articles = doc.querySelectorAll('article.product_pod');
+        const rows = [];
 
         articles.forEach(article => {
             const titleEl = article.querySelector('h3 a');
             const title = titleEl ? cleanText(titleEl.getAttribute('title') || titleEl.textContent) : '';
-
             const priceRaw = cleanText(article.querySelector('.price_color')?.textContent || '');
-            // Separa símbolo da moeda do valor numérico
             const currency = priceRaw.replace(/[0-9.,]/g, '').trim() || '£';
             const price = priceRaw.replace(/[^0-9.,]/g, '').trim();
-
             const availability = cleanText(article.querySelector('.availability')?.textContent || '');
             const rating = getRating(article);
-            const bookUrl = toAbsoluteUrl(titleEl?.getAttribute('href') || '');
-            const imageUrl = toAbsoluteUrl(article.querySelector('img')?.getAttribute('src') || '');
+            const bookUrl = toAbsoluteUrl(titleEl?.getAttribute('href') || '', baseUrl);
+            const imageUrl = toAbsoluteUrl(article.querySelector('img')?.getAttribute('src') || '', baseUrl);
 
             rows.push(rowToCSV([
                 categoryName, title, price, currency,
@@ -141,32 +118,50 @@
         return rows;
     }
 
+    // ── Paginação ─────────────────────────────────────────────────────────────
+
+    function getNextPageUrl(doc, currentUrl) {
+        const nextBtn = doc.querySelector('li.next a');
+        if (!nextBtn) return null;
+        return toAbsoluteUrl(nextBtn.getAttribute('href'), currentUrl);
+    }
+
     // ── Execução principal ────────────────────────────────────────────────────
 
-    function run() {
+    async function run() {
         const categoryRows = scrapeCategories();
-        const bookRows = scrapeBooks();
+
+        const categoryName = cleanText(
+            document.querySelector('.page-header.action h1')?.textContent || 'All products'
+        );
+
+        const header = rowToCSV([
+            'category_name', 'book_title', 'price', 'currency',
+            'availability', 'rating', 'book_url', 'image_url'
+        ]);
+        const allBookRows = [header];
+
+        // Página atual (já carregada)
+        let currentUrl = window.location.href;
+        allBookRows.push(...extractBooksFromDoc(document, categoryName, currentUrl));
+
+        // Percorre as demais páginas automaticamente
+        let nextUrl = getNextPageUrl(document, currentUrl);
+        while (nextUrl) {
+            const response = await fetch(nextUrl);
+            const html = await response.text();
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            allBookRows.push(...extractBooksFromDoc(doc, categoryName, nextUrl));
+            currentUrl = nextUrl;
+            nextUrl = getNextPageUrl(doc, currentUrl);
+        }
 
         downloadCSV('categories.csv', categoryRows);
-        // Pequeno delay para o segundo download não ser bloqueado pelo navegador
-        setTimeout(() => downloadCSV('books.csv', bookRows), 500);
-
-        const totalCategories = categoryRows.length - 1;
-        const totalBooks = bookRows.length - 1;
-        alert(
-            `✅ CSVs gerados com sucesso!\n\n` +
-            `📁 categories.csv — ${totalCategories} categoria(s)\n` +
-            `📚 books.csv — ${totalBooks} livro(s) na página atual`
-        );
+        setTimeout(() => downloadCSV('books.csv', allBookRows), 500);
     }
 
-    // ── Registro do menu no Tampermonkey ──────────────────────────────────────
+    // ── Registro do menu no Tampermonkey (somente manual) ─────────────────────
 
-    if (typeof GM_registerMenuCommand !== 'undefined') {
-        GM_registerMenuCommand('📥 Exportar CSV (categorias + livros)', run);
-    } else {
-        // Fallback: executa ao carregar se GM_registerMenuCommand não estiver disponível
-        window.addEventListener('load', run);
-    }
+    GM_registerMenuCommand('📥 Exportar CSV (categorias + livros)', run);
 
 })();
